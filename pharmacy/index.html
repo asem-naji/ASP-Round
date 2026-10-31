@@ -106,6 +106,14 @@ function esc(s){ return (s||"").toString().replace(/[&<>"']/g, c => ({"&":"&amp;
 
 /* Computes expiry status for an approved entry with a numeric (non-STAT) duration.
    Returns null for rejected entries, STAT orders, or entries with no duration set. */
+function fmtDate(d){
+  const p2 = n => String(n).padStart(2,"0");
+  return `${d.getFullYear()}-${p2(d.getMonth()+1)}-${p2(d.getDate())}`;
+}
+function fmtDateTime(d){
+  const p2 = n => String(n).padStart(2,"0");
+  return `${fmtDate(d)} ${p2(d.getHours())}:${p2(d.getMinutes())}`;
+}
 function orderExpiryInfo(e){
   if (e.primary !== "approve") return null;
   if (!e.approvalDuration || e.approvalDuration === "STAT") return null;
@@ -128,15 +136,12 @@ function orderExpiryInfo(e){
    ============================================================ */
 let entries = [];
 let requests = [];
-let tab = "requests";
-let activeOrdersQuery = "";
-let activeOrdersStatusFilter = "all"; // "all" | "active" | "near" | "expired"
-function setTab(t){ tab = t; render(); }
-function setActiveOrdersQuery(val){ activeOrdersQuery = val; render(); }
-function setActiveOrdersStatusFilter(val){ activeOrdersStatusFilter = val; render(); }
-window.setTab = setTab;
-window.setActiveOrdersQuery = setActiveOrdersQuery;
-window.setActiveOrdersStatusFilter = setActiveOrdersStatusFilter;
+let query = "";
+let statusFilter = "all"; // "all" | "pending" | "near" | "active" | "completed" | "rejected"
+function setQuery(val){ query = val; render(); }
+function setStatusFilter(val){ statusFilter = val; render(); }
+window.setQuery = setQuery;
+window.setStatusFilter = setStatusFilter;
 
 /* Live, read-only subscriptions — the view updates automatically
    the instant the ASP team logs a decision or a new request comes in.
@@ -157,15 +162,95 @@ function isUnlocked(){
   return localStorage.getItem(UNLOCK_KEY) === "1";
 }
 
+/* Builds one normalized list combining pending requests (not yet decided)
+   with every logged entry (approved/rejected, with expiry status for
+   approved ones). This is what lets the whole page use a single search
+   box and a single status filter instead of two separate tabs. */
+function buildUnifiedList(){
+  const items = [];
+
+  requests.filter(r => r.status === "pending").forEach(r => {
+    items.push({
+      status: "pending", sortKey: 0, statusLabel: "Pending", statusColor: "var(--escalate)", statusBg: "#FFF4E3",
+      antibiotic: r.antibiotic, fileNumber: r.fileNumber, bedNumber: r.bedNumber, department: r.department,
+      patientName: r.patientName, by: r.requesterName, byLabel: "Requested by", dateTime: r.dateTime,
+      detail: "Awaiting ID decision.",
+    });
+  });
+
+  entries.forEach(e => {
+    if (e.primary === "reject") {
+      items.push({
+        status: "rejected", sortKey: 4, statusLabel: "Rejected", statusColor: "var(--reject)", statusBg: "#FBEAE6",
+        antibiotic: e.antibiotic, fileNumber: e.fileNumber, bedNumber: e.bedNumber, department: e.department,
+        patientName: e.patientName, by: e.prescriber, byLabel: "Reviewed by", dateTime: e.dateTime,
+        detail: "Rejected — do not dispense.",
+      });
+      return;
+    }
+    if (e.primary !== "approve") return;
+
+    const info = orderExpiryInfo(e); // null for STAT or no duration set
+    let status, sortKey, statusLabel, statusColor, statusBg, detail;
+    if (!e.approvalDuration || e.approvalDuration === "STAT") {
+      status = "completed"; sortKey = 3; statusLabel = "Completed (STAT)"; statusColor = "var(--neutral)"; statusBg = "#EFF1EC";
+      detail = "Single (STAT) dose — already administered.";
+    } else if (info.status === "expired") {
+      status = "completed"; sortKey = 3; statusLabel = "Completed"; statusColor = "var(--neutral)"; statusBg = "#EFF1EC";
+      detail = `Course finished ${fmtDate(info.expiry)} — re-review needed if continuing.`;
+    } else if (info.status === "near") {
+      status = "near"; sortKey = 1; statusLabel = "Expiring soon"; statusColor = "var(--escalate)"; statusBg = "#FFF4E3";
+      detail = `Expires ${fmtDateTime(info.expiry)}`;
+    } else {
+      status = "active"; sortKey = 2; statusLabel = "Active"; statusColor = "var(--approve)"; statusBg = "#EAF4EE";
+      detail = `Approved, running until ${fmtDate(info.expiry)}.`;
+    }
+    items.push({
+      status, sortKey, statusLabel, statusColor, statusBg,
+      antibiotic: e.antibiotic, fileNumber: e.fileNumber, bedNumber: e.bedNumber, department: e.department,
+      patientName: e.patientName, by: e.prescriber, byLabel: "Approved by", dateTime: e.dateTime, detail,
+    });
+  });
+
+  return items;
+}
+
 function render(){
   const app = document.getElementById("app");
   if (!isUnlocked()){ app.innerHTML = renderLock(); return; }
 
-  const pendingCount = requests.filter(r => r.status === "pending").length;
-  const activeOrdersAlertCount = entries.filter(e => {
-    const info = orderExpiryInfo(e);
-    return info && (info.status === "near" || info.status === "expired");
-  }).length;
+  // Preserve focus + cursor position across re-render, so typing in the
+  // search box doesn't kick focus out after every character.
+  const active = document.activeElement;
+  const activeId = (active && active.id && app.contains(active)) ? active.id : null;
+  const selStart = activeId && typeof active.selectionStart === "number" ? active.selectionStart : null;
+  const selEnd = activeId && typeof active.selectionEnd === "number" ? active.selectionEnd : null;
+
+  const all = buildUnifiedList();
+  const counts = { pending: 0, near: 0, active: 0, completed: 0, rejected: 0 };
+  all.forEach(x => { counts[x.status] = (counts[x.status]||0) + 1; });
+
+  const q = query.trim().toLowerCase();
+  let list = all.filter(x => {
+    if (statusFilter !== "all" && x.status !== statusFilter) return false;
+    if (!q) return true;
+    return (x.fileNumber||"").toLowerCase().includes(q)
+        || (x.patientName||"").toLowerCase().includes(q)
+        || (x.antibiotic||"").toLowerCase().includes(q);
+  });
+  list.sort((a,b) => a.sortKey - b.sortKey || (b.dateTime||"").localeCompare(a.dateTime||""));
+
+  const card = (x) => `<div class="req-card" style="background:${x.statusBg}; border-color:${x.statusColor};">
+    <div class="req-top">
+      <div>
+        <div style="font-weight:600; font-size:14.5px;">${esc(x.antibiotic||"")} <span class="muted" style="font-weight:400; font-size:12.5px;">— File ${esc(x.fileNumber||"")}${x.bedNumber?', Bed '+esc(x.bedNumber):''}${x.department?', '+esc(x.department):''}</span></div>
+        ${x.patientName ? `<div class="muted" style="font-size:12.5px; margin-top:2px;">${esc(x.patientName)}</div>` : ""}
+        <div class="muted" style="font-size:12px; margin-top:2px;">${esc(x.detail||"")}</div>
+        <div class="muted" style="font-size:11.5px; margin-top:2px;">${x.byLabel} ${esc(x.by||"Unknown")} · ${dateOnly(x.dateTime||"")} ${timeOnly(x.dateTime||"")}</div>
+      </div>
+      <span class="status-pill" style="background:${x.statusColor}; color:#fff; white-space:nowrap;">${x.statusLabel}</span>
+    </div>
+  </div>`;
 
   app.innerHTML = `
     <div class="header">
@@ -176,14 +261,46 @@ function render(){
           <p class="sub">Restricted antimicrobial status — live<span class="conn-dot" style="background:var(--approve); margin-left:6px;"></span>auto-updating</p>
         </div>
       </div>
-      <nav>
-        <button class="${tab==='requests'?'active':''}" onclick="setTab('requests')">Requests${pendingCount>0?` <span class="req-badge">${pendingCount}</span>`:''}</button>
-        <button class="${tab==='active'?'active':''}" onclick="setTab('active')">Order Status${activeOrdersAlertCount>0?` <span class="req-badge">${activeOrdersAlertCount}</span>`:''}</button>
-      </nav>
     </div>
-    ${tab === "requests" ? renderRequests() : renderActiveOrders()}
+    <div class="card" style="margin-bottom:16px;">
+      <div style="display:flex; gap:16px; flex-wrap:wrap; margin-bottom:14px;">
+        <div><span style="font-weight:700; color:var(--escalate);">${counts.pending}</span> <span class="muted" style="font-size:12.5px;">pending</span></div>
+        <div><span style="font-weight:700; color:var(--escalate);">${counts.near}</span> <span class="muted" style="font-size:12.5px;">expiring soon</span></div>
+        <div><span style="font-weight:700; color:var(--approve);">${counts.active}</span> <span class="muted" style="font-size:12.5px;">active</span></div>
+        <div><span style="font-weight:700; color:var(--neutral);">${counts.completed}</span> <span class="muted" style="font-size:12.5px;">completed</span></div>
+        <div><span style="font-weight:700; color:var(--reject);">${counts.rejected}</span> <span class="muted" style="font-size:12.5px;">rejected</span></div>
+      </div>
+      <div class="grid">
+        <div class="field" style="margin-bottom:0;">
+          <label>Filter by status</label>
+          <select onchange="setStatusFilter(this.value)">
+            <option value="all" ${statusFilter==='all'?'selected':''}>All (${all.length})</option>
+            <option value="pending" ${statusFilter==='pending'?'selected':''}>Pending (${counts.pending})</option>
+            <option value="near" ${statusFilter==='near'?'selected':''}>Expiring soon (${counts.near})</option>
+            <option value="active" ${statusFilter==='active'?'selected':''}>Active (${counts.active})</option>
+            <option value="completed" ${statusFilter==='completed'?'selected':''}>Completed (${counts.completed})</option>
+            <option value="rejected" ${statusFilter==='rejected'?'selected':''}>Rejected (${counts.rejected})</option>
+          </select>
+        </div>
+        <div class="field" style="margin-bottom:0;">
+          <label>Search by file number, patient, or antibiotic</label>
+          <input id="f-query" value="${esc(query)}" placeholder="e.g. 1234567, Ali Hassan, Meropenem" oninput="setQuery(this.value)" />
+        </div>
+      </div>
+    </div>
+    ${list.length===0 ? `<div class="card"><p class="muted">${all.length===0 ? "No records yet." : "Nothing matches this filter/search."}</p></div>` : list.map(card).join("")}
     ${renderFooter()}
   `;
+
+  if (activeId) {
+    const el = document.getElementById(activeId);
+    if (el) {
+      el.focus();
+      if (selStart !== null && el.setSelectionRange) {
+        try { el.setSelectionRange(selStart, selEnd); } catch(e) {}
+      }
+    }
+  }
 }
 
 function renderFooter(){
@@ -215,131 +332,6 @@ function checkPassword(){
 }
 window.checkPassword = checkPassword;
 
-function renderRequests(){
-  const pending = requests.filter(r => r.status === "pending").sort((a,b) => (b.createdAt||0)-(a.createdAt||0));
-  const resolved = requests.filter(r => r.status !== "pending").sort((a,b) => (b.resolvedAt||0)-(a.resolvedAt||0)).slice(0, 30);
-
-  const reqCard = (r) => {
-    const statusColor = r.status === "approve" ? "var(--approve)" : r.status === "reject" ? "var(--reject)" : "var(--escalate)";
-    const statusLabel = r.status === "approve" ? "Approved" : r.status === "reject" ? "Rejected" : "Pending";
-    const doseLine = [r.dose, r.frequency ? (FREQUENCY_OPTIONS_MAP[r.frequency]||r.frequency) : "", r.duration ? (r.duration==="STAT"?"STAT":r.duration+" days") : ""].filter(Boolean).join(" · ");
-    const clinical = [
-      r.diagnosis||r.indication, r.justification ? `Justification: ${r.justification}` : "",
-      r.therapyBasis ? (THERAPY_BASIS.find(b=>b.id===r.therapyBasis)||{}).label : "",
-      r.organism ? `Organism: ${r.organism}` : "", r.specimenSite ? `Specimen: ${r.specimenSite}` : "",
-      r.crcl!=null ? `CrCl: ${r.crcl} mL/min` : "",
-    ].filter(Boolean).join(" · ");
-    return `<div class="req-card">
-      <div class="req-top">
-        <div>
-          <div style="font-weight:600; font-size:14.5px;">${esc(r.antibiotic||"")} <span class="muted" style="font-weight:400; font-size:12.5px;">— File ${esc(r.fileNumber||"")}${r.bedNumber?', Bed '+esc(r.bedNumber):''}, ${esc(r.department||"")}</span></div>
-          ${r.patientName ? `<div class="muted" style="font-size:12.5px; margin-top:2px;">${esc(r.patientName)}</div>` : ""}
-          ${clinical ? `<div class="muted" style="font-size:12.5px; margin-top:2px;">${esc(clinical)}</div>` : ""}
-          ${doseLine ? `<div class="muted" style="font-size:12.5px; margin-top:2px;">${esc(doseLine)}</div>` : ""}
-          <div class="muted" style="font-size:12px; margin-top:2px;">Requested by ${esc(r.requesterName||"Unknown")} · ${dateOnly(r.dateTime||"")} ${timeOnly(r.dateTime||"")}</div>
-        </div>
-        <span class="status-pill" style="background:${statusColor}; color:#fff;">${statusLabel}</span>
-      </div>
-    </div>`;
-  };
-
-  return `
-    <div class="card" style="margin-bottom:20px;">
-      <h3 class="section-title">Pending requests (${pending.length})</h3>
-      ${pending.length===0 ? `<p class="muted">No pending requests right now.</p>` : pending.map(reqCard).join("")}
-    </div>
-    <div class="card">
-      <h3 class="section-title">Recently resolved</h3>
-      ${resolved.length===0 ? `<p class="muted">Nothing resolved yet.</p>` : resolved.map(reqCard).join("")}
-    </div>
-  `;
-}
-
-function renderActiveOrders(){
-  const q = activeOrdersQuery.trim().toLowerCase();
-  const withExpiry = entries
-    .map(e => ({ e, info: orderExpiryInfo(e) }))
-    .filter(x => x.info !== null);
-
-  const filtered = withExpiry.filter(({ e }) => {
-    if (activeOrdersStatusFilter !== "all" && (orderExpiryInfo(e)||{}).status !== activeOrdersStatusFilter) return false;
-    if (!q) return true;
-    return (e.fileNumber||"").toLowerCase().includes(q)
-        || (e.patientName||"").toLowerCase().includes(q)
-        || (e.antibiotic||"").toLowerCase().includes(q);
-  });
-
-  const STATUS_ORDER = { active: 0, near: 1, expired: 2 };
-  filtered.sort((a,b) => {
-    const byStatus = STATUS_ORDER[a.info.status] - STATUS_ORDER[b.info.status];
-    return byStatus !== 0 ? byStatus : (a.info.expiry - b.info.expiry);
-  });
-
-  const expiredCount = withExpiry.filter(x => x.info.status === "expired").length;
-  const nearCount = withExpiry.filter(x => x.info.status === "near").length;
-  const activeCount = withExpiry.filter(x => x.info.status === "active").length;
-
-  const STATUS_META = {
-    active: { label: "Active", color: "var(--approve)", bg: "#EAF4EE" },
-    near: { label: "Expiring soon", color: "var(--escalate)", bg: "#FFF4E3" },
-    expired: { label: "Expired — needs review", color: "var(--reject)", bg: "#FBEAE6" },
-  };
-
-  const fmtExpiry = (d) => {
-    const pad2 = n => String(n).padStart(2,"0");
-    return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
-  };
-  const fmtRemaining = (hrs) => {
-    if (hrs < 0) {
-      const h = Math.abs(hrs);
-      return h < 24 ? `${Math.round(h)}h overdue` : `${Math.round(h/24)}d overdue`;
-    }
-    return hrs < 24 ? `${Math.round(hrs)}h left` : `${Math.round(hrs/24)}d left`;
-  };
-
-  const row = ({ e, info }) => {
-    const meta = STATUS_META[info.status];
-    return `<div class="req-card" style="background:${meta.bg}; border-color:${meta.color};">
-      <div class="req-top">
-        <div>
-          <div style="font-weight:600; font-size:14.5px;">${esc(e.antibiotic||"")} <span class="muted" style="font-weight:400; font-size:12.5px;">— File ${esc(e.fileNumber||"")}${e.bedNumber?', Bed '+esc(e.bedNumber):''}, ${esc(e.department||"")}</span></div>
-          ${e.patientName ? `<div class="muted" style="font-size:12.5px; margin-top:2px;">${esc(e.patientName)}</div>` : ""}
-          <div class="muted" style="font-size:12px; margin-top:2px;">Approved ${dateOnly(e.dateTime)} ${timeOnly(e.dateTime)} · Duration: ${esc(e.approvalDuration)} day${e.approvalDuration==="1"?"":"s"} · Expires ${fmtExpiry(info.expiry)}</div>
-        </div>
-        <div style="text-align:right;">
-          <span class="status-pill" style="background:${meta.color}; color:#fff;">${meta.label}</span>
-          <div class="muted" style="font-size:11.5px; margin-top:3px;">${fmtRemaining(info.hoursLeft)}</div>
-        </div>
-      </div>
-    </div>`;
-  };
-
-  return `
-    <div class="card" style="margin-bottom:16px;">
-      <div style="display:flex; gap:18px; flex-wrap:wrap; margin-bottom:14px;">
-        <div><span style="font-weight:700; color:var(--approve);">${activeCount}</span> <span class="muted" style="font-size:12.5px;">active</span></div>
-        <div><span style="font-weight:700; color:var(--escalate);">${nearCount}</span> <span class="muted" style="font-size:12.5px;">expiring within 24h</span></div>
-        <div><span style="font-weight:700; color:var(--reject);">${expiredCount}</span> <span class="muted" style="font-size:12.5px;">expired, needs review</span></div>
-      </div>
-      <div class="grid">
-        <div class="field" style="margin-bottom:0;">
-          <label>Filter by status</label>
-          <select onchange="setActiveOrdersStatusFilter(this.value)">
-            <option value="all" ${activeOrdersStatusFilter==='all'?'selected':''}>All statuses</option>
-            <option value="active" ${activeOrdersStatusFilter==='active'?'selected':''}>Active only</option>
-            <option value="near" ${activeOrdersStatusFilter==='near'?'selected':''}>Expiring soon only</option>
-            <option value="expired" ${activeOrdersStatusFilter==='expired'?'selected':''}>Expired only</option>
-          </select>
-        </div>
-        <div class="field" style="margin-bottom:0;">
-          <label>Search by file number, patient, or antibiotic</label>
-          <input id="f-activeOrdersQuery" value="${esc(activeOrdersQuery)}" placeholder="e.g. 1234567, Ali Hassan, Meropenem" oninput="setActiveOrdersQuery(this.value)" />
-        </div>
-      </div>
-    </div>
-    ${filtered.length===0 ? `<div class="card"><p class="muted">${withExpiry.length===0 ? "No active restricted-antibiotic courses on record yet." : "No orders match this filter/search."}</p></div>` : filtered.map(row).join("")}
-  `;
-}
 
 render();
 
