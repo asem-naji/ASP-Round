@@ -252,6 +252,21 @@ function dateOnly(dt){ return dt.slice(0,10); }
 function timeOnly(dt){ return dt.slice(11,16); }
 function monthOf(dt){ return dt.slice(0,7); }
 function monthLabel(m){ const [y,mm]=m.split("-"); return new Date(Number(y), Number(mm)-1, 1).toLocaleDateString("en-US",{month:"long",year:"numeric"}); }
+
+/* Period filter for the Monthly Summary tab. A "period" is one of:
+   - "all"            → every entry, all time
+   - "year-YYYY"       → every entry in that calendar year
+   - "YYYY-MM"         → a single month (the original behavior)   */
+function periodLabel(period){
+  if (period === "all") return "All time";
+  if (period.startsWith("year-")) return `Year ${period.slice(5)}`;
+  return monthLabel(period);
+}
+function matchesPeriod(dt, period){
+  if (period === "all") return true;
+  if (period.startsWith("year-")) return dt.slice(0,4) === period.slice(5);
+  return monthOf(dt) === period;
+}
 function esc(s){ return (s||"").toString().replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 
 /* ============================================================
@@ -894,7 +909,10 @@ function renderSummary(){
   const months = new Set(entries.map(e => monthOf(e.dateTime)));
   months.add(monthOf(nowLocalDateTime()));
   const monthList = Array.from(months).sort().reverse();
-  const monthEntries = entries.filter(e => monthOf(e.dateTime) === selectedMonth);
+  const years = new Set(entries.map(e => e.dateTime.slice(0,4)));
+  years.add(nowLocalDateTime().slice(0,4));
+  const yearList = Array.from(years).sort().reverse();
+  const monthEntries = entries.filter(e => matchesPeriod(e.dateTime, selectedMonth));
 
   const byModifier = MODIFIERS.map(d => ({ name: d.label, value: monthEntries.filter(e => (e.modifiers||[]).includes(d.id)).length, hex: d.hex }));
   const byDept = {}; monthEntries.forEach(e => byDept[e.department] = (byDept[e.department]||0)+1);
@@ -965,12 +983,18 @@ function renderSummary(){
 
   return `
     <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; flex-wrap:wrap; gap:10px;">
-      <h2 style="font-size:19px;">${monthLabel(selectedMonth)}</h2>
+      <h2 style="font-size:19px;">${periodLabel(selectedMonth)}</h2>
       <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
         <select style="width:auto;" onchange="setMonth(this.value)">
-          ${monthList.map(m => `<option value="${m}" ${m===selectedMonth?'selected':''}>${monthLabel(m)}</option>`).join("")}
+          <option value="all" ${selectedMonth==='all'?'selected':''}>All time</option>
+          <optgroup label="By year">
+            ${yearList.map(y => `<option value="year-${y}" ${selectedMonth==='year-'+y?'selected':''}>Year ${y}</option>`).join("")}
+          </optgroup>
+          <optgroup label="By month">
+            ${monthList.map(m => `<option value="${m}" ${m===selectedMonth?'selected':''}>${monthLabel(m)}</option>`).join("")}
+          </optgroup>
         </select>
-        <button class="btn-primary" style="background:var(--teal-dark);" onclick="exportCSV(false)">⭳ This month</button>
+        <button class="btn-primary" style="background:var(--teal-dark);" onclick="exportCSV(false)">⭳ Export this period</button>
         <button class="btn-primary" style="background:var(--neutral);" onclick="exportCSV(true)">⭳ All data</button>
       </div>
     </div>
@@ -1133,7 +1157,7 @@ function toggleModifier(id){
 function setMonth(m){ selectedMonth = m; render(); }
 
 function exportCSV(allData){
-  const rows = allData ? entries : entries.filter(e => monthOf(e.dateTime) === selectedMonth);
+  const rows = allData ? entries : entries.filter(e => matchesPeriod(e.dateTime, selectedMonth));
   const cols = ["Date","Time","File number","Patient name","Department","Bed","Antibiotic","Restriction group","Timing of review","Therapy basis","Specimen site","Organism","Age","Weight","Sex","Creatinine","CrCl","Dose","Frequency","Primary decision","Rejection reason","Modifications","Approval duration","Indication/diagnosis","Justification","Prescriber","Notes"];
   const csvEscape = (v) => `"${(v==null?"":String(v)).replace(/"/g,'""')}"`;
   const lines = [cols.map(csvEscape).join(",")];
